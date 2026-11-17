@@ -1,0 +1,23 @@
+{
+  "name": "aiostreams-jellyfin-local",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AIOStreams addon that offers files from chosen Jellyfin libraries as streams and catalogs.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/addon.ts",
+    "dev": "node --watch src/addon.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@aiostreams/addon-sdk": "^0.2.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
