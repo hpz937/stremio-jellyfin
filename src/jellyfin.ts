@@ -21,8 +21,14 @@ export interface MediaStream {
   Width?: number;
   Height?: number;
   Language?: string;
+  /** SDR, HDR10, HDR10Plus, HLG, DOVI, DOVIWithHDR10, ... */
   VideoRangeType?: string;
   DisplayTitle?: string;
+  BitDepth?: number;
+  Channels?: number;
+  /** e.g. "DTS-HD MA", "Main 10". */
+  Profile?: string;
+  IsDefault?: boolean;
 }
 
 export interface MediaSource {

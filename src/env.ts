@@ -22,6 +22,13 @@ export const env = defineEnv({
   JELLYFIN_USERNAME: z.string().min(1),
   JELLYFIN_PASSWORD: z.string().default(''),
 
+  /**
+   * Asked for on the configure page before an install link is made, so someone who
+   * finds this addon can't get a link (and with it the Jellyfin token). Install links
+   * are encrypted with a key derived from it; changing it revokes every link.
+   */
+  ACCESS_KEY: z.string().min(12, 'use at least 12 characters'),
+
   /** How often the library index is rebuilt. */
   REFRESH_MINUTES: z.coerce.number().min(1).default(15),
 

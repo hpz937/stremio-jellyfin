@@ -8,9 +8,11 @@ import {
   type Stream,
 } from '@aiostreams/addon-sdk';
 import { serve } from '@aiostreams/addon-sdk/node';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { ANIME_SOURCES, animeRelease, refreshAnimeIds, type AnimeSource } from './anime.ts';
 import { env, publicUrl } from './env.ts';
+import { cleanFilename } from './filename.ts';
 import {
   allEpisodes,
   getSession,
@@ -69,7 +71,27 @@ for (const library of libraries) {
 const labels = [...labelOf.keys()] as [string, ...string[]];
 const libraryById = new Map(libraries.map((library) => [library.Id, library]));
 
+// ---------------------------------------------------------------------------
+// Access key: the configure page only makes a link for someone who knows
+// ACCESS_KEY, and links are encrypted so it can't be read back out of one.
+// ---------------------------------------------------------------------------
+
+const digest = (value: string) => createHash('sha256').update(value).digest();
+const accessDigest = digest(env.ACCESS_KEY);
+/** Compares digests, so the check takes the same time however much of the key is right. */
+const isAccessKey = (value: string) => timingSafeEqual(digest(value), accessDigest);
+/** The install-link encryption secret, so changing ACCESS_KEY also revokes old links. */
+const configSecret = createHash('sha256').update(`jellyfin-local config\0${env.ACCESS_KEY}`).digest('hex');
+
 const Settings = z.object({
+  accessKey: z
+    .string()
+    .refine(isAccessKey, 'Wrong access key')
+    .meta({
+      title: 'Access key',
+      description: "The addon's `ACCESS_KEY`. Ask whoever runs this addon for it.",
+      writeOnly: true,
+    }),
   libraries: z
     .array(z.enum(labels))
     .min(1, 'Pick at least one library')
@@ -92,6 +114,21 @@ const Settings = z.object({
       title: 'Browser versions',
       description:
         'Adds a second, transcoded link (H.264 + AAC) for files a web browser cannot play, like MKV, HEVC or 10-bit video. Jellyfin does the transcoding, so its user needs permission to transcode. Pick the maximum quality, or off.',
+    }),
+  filenames: z
+    .enum(['clean', 'original'])
+    .default('clean')
+    .meta({
+      title: 'Filenames for AIOStreams',
+      description:
+        "AIOStreams reads a stream's resolution, codec, audio and languages from its filename. Clean gives it one built from Jellyfin's title, season/episode numbers and media info (e.g. `Show - S01E05 [BluRay 1080p HEVC 10bit][FLAC 2.0][Japanese][Eng Subs].mkv`); original sends the file's real name.",
+    }),
+  releaseGroup: z
+    .enum(['remove', 'prefix', 'suffix'])
+    .default('remove')
+    .meta({
+      title: 'Release group in clean filenames',
+      description: 'Leave it out, put it first (`[Group] Show - S01E05 ...`), or last (`... .mkv` as `...-Group.mkv`).',
     }),
 });
 type Settings = z.output<typeof Settings>;
@@ -169,11 +206,14 @@ function size(bytes: number | undefined): string | undefined {
 
 const basename = (path: string | undefined) => path?.split(/[\\/]/).pop();
 
-function toStream(item: Item, source: MediaSource, title: Title, token: string): Stream {
+function toStream(item: Item, source: MediaSource, title: Title, token: string, config: Settings): Stream {
   const res = resolution(source);
   const video = source.MediaStreams?.find((stream) => stream.Type === 'Video');
   const audio = source.MediaStreams?.find((stream) => stream.Type === 'Audio');
   const filename = basename(source.Path);
+  // What AIOStreams parses; the description keeps the real name for people.
+  const parsedName =
+    (config.filenames === 'clean' && cleanFilename(item, source, title, config.releaseGroup)) || filename;
   const url = new URL(`${publicUrl}/Videos/${item.Id}/stream`);
   url.searchParams.set('static', 'true');
   url.searchParams.set('mediaSourceId', source.Id);
@@ -192,7 +232,7 @@ function toStream(item: Item, source: MediaSource, title: Title, token: string):
       .filter(Boolean)
       .join('\n'),
     behaviorHints: {
-      filename,
+      filename: parsedName,
       videoSize: source.Size,
       duration: ticks ? ticks / 10_000_000 : undefined,
       notWebReady: source.Container?.toLowerCase() !== 'mp4',
@@ -433,7 +473,7 @@ const addon = defineAddon({
     };
   },
 
-  config: settingsSchema,
+  config: { schema: settingsSchema, secret: configSecret },
   theme: { accent: '#aa5cc3' },
 
   catalog: ({ type, id, extra, config }) => {
@@ -460,7 +500,7 @@ const addon = defineAddon({
     for (const { title, season, episode } of targets) {
       for (const item of await itemsFor(title, season, episode)) {
         for (const source of item.MediaSources ?? []) {
-          const direct = toStream(item, source, title, token);
+          const direct = toStream(item, source, title, token, config);
           streams.push(direct);
           if (config.browserVersions !== 'off' && direct.behaviorHints?.notWebReady) {
             streams.push(toTranscodedStream(item, source, title, token, config.browserVersions));
