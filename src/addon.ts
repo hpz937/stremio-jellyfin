@@ -4,8 +4,10 @@ import {
   defineAddon,
   notFound,
   type CatalogEntry,
+  type Logger,
   type StandardSchemaV1,
   type Stream,
+  type WatchStateEvent,
 } from '@aiostreams/addon-sdk';
 import { serve } from '@aiostreams/addon-sdk/node';
 import { createHash, timingSafeEqual } from 'node:crypto';
@@ -19,6 +21,9 @@ import {
   libraries as listLibraries,
   movieSources,
   seasonEpisodes,
+  setPlayed,
+  setResumePosition,
+  users as listUsers,
   type Item,
   type Library,
   type MediaSource,
@@ -71,6 +76,17 @@ for (const library of libraries) {
 const labels = [...labelOf.keys()] as [string, ...string[]];
 const libraryById = new Map(libraries.map((library) => [library.Id, library]));
 
+// Jellyfin users whose watched status can follow AIOStreams: every user with
+// JELLYFIN_API_KEY, otherwise only the addon's own. Read once at startup too.
+const watchUsers = new Map<string, string>();
+try {
+  for (const user of await listUsers()) watchUsers.set(user.Name, user.Id);
+} catch (err) {
+  log.warn({ err }, 'cannot list Jellyfin users; watched status can only be synced to the addon user');
+  watchUsers.set(env.JELLYFIN_USERNAME, (await getSession()).userId);
+}
+const WATCH_OFF = 'off';
+
 // ---------------------------------------------------------------------------
 // Access key: the configure page only makes a link for someone who knows
 // ACCESS_KEY, and links are encrypted so it can't be read back out of one.
@@ -122,6 +138,17 @@ const Settings = z.object({
       title: 'Filenames for AIOStreams',
       description:
         "AIOStreams reads a stream's resolution, codec, audio and languages from its filename. Clean gives it one built from Jellyfin's title, season/episode numbers and media info (e.g. `Show - S01E05 [BluRay 1080p HEVC 10bit][FLAC 2.0][Japanese][Eng Subs].mkv`); original sends the file's real name.",
+    }),
+  watchedUser: z
+    .enum([WATCH_OFF, ...watchUsers.keys()])
+    .default(WATCH_OFF)
+    // A link naming a user that no longer exists still works, without syncing.
+    .catch(WATCH_OFF)
+    .meta({
+      title: 'Sync watched status to',
+      description: env.JELLYFIN_API_KEY
+        ? 'When you finish (or mark) a movie or episode in AIOStreams, it is marked watched for this Jellyfin user, and a stopped one keeps its resume point. Reinstall the link after changing this.'
+        : `When you finish (or mark) a movie or episode in AIOStreams, it is marked watched in Jellyfin. Only the addon's own user (\`${env.JELLYFIN_USERNAME}\`) can be picked until \`JELLYFIN_API_KEY\` is set. Reinstall the link after changing this.`,
     }),
   releaseGroup: z
     .enum(['remove', 'prefix', 'suffix'])
@@ -442,13 +469,106 @@ function toEntry(title: Title): CatalogEntry {
 const catalogIdOf = (library: Library) => `jellyfin-${library.Id}`;
 
 // ---------------------------------------------------------------------------
+// Watched status: AIOStreams pushes what was finished, stopped or marked, and
+// the matching Jellyfin items (every version in the chosen libraries) follow.
+// ---------------------------------------------------------------------------
+
+const watchUserId = (config: Settings) =>
+  config.watchedUser === WATCH_OFF ? undefined : watchUsers.get(config.watchedUser);
+
+/** Below this share of a video, a stop leaves no resume point (Jellyfin's own default). */
+const MIN_RESUME = 0.05;
+/** Past this share, a stop counts as finished when AIOStreams didn't say. */
+const PLAYED_SHARE = 0.9;
+/** Jellyfin writes in flight at once for a whole-season or whole-show mark. */
+const WRITE_CONCURRENCY = 8;
+
+interface Video {
+  videoId?: string;
+  season?: number | null;
+  episode?: number | null;
+}
+
+/** The Jellyfin items for one pushed video, found the way its streams are. */
+async function videoItemIds(kind: Kind, metaId: string, video: Video, libraryIds: Set<string>): Promise<string[]> {
+  // The video id says which episode in its own id space; the meta id plus numbering is the fallback.
+  const ids = [video.videoId, kind === 'movie' ? metaId : undefined];
+  if (kind === 'series' && video.season != null && video.episode != null) {
+    ids.push(`${metaId}:${video.season}:${video.episode}`);
+  }
+  for (const id of ids) {
+    if (!id) continue;
+    const found = new Set<string>();
+    for (const { title, season, episode } of await targetsFor(kind, id, libraryIds)) {
+      for (const item of await itemsFor(title, season, episode)) found.add(item.Id);
+    }
+    if (found.size) return [...found];
+  }
+  return [];
+}
+
+async function eachLimited<T>(values: T[], limit: number, run: (value: T) => Promise<void>) {
+  let next = 0;
+  const worker = async () => {
+    while (next < values.length) await run(values[next++]!);
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, worker));
+}
+
+async function pushWatchState(event: WatchStateEvent, config: Settings, log: Logger) {
+  const userId = watchUserId(config);
+  if (!userId) return;
+  if (event.event !== 'stop' && event.event !== 'played' && event.event !== 'unplayed') return;
+  const libraryIds = chosenIds(config);
+  const at = new Date(event.at * 1000);
+
+  if ('videos' in event) {
+    // A whole season or show marked at once.
+    let matched = 0;
+    await eachLimited(event.videos, WRITE_CONCURRENCY, async (video) => {
+      for (const itemId of await videoItemIds('series', event.metaId, video, libraryIds)) {
+        await setPlayed(itemId, userId, event.event === 'played', at);
+        matched++;
+      }
+    });
+    log.info({ event: event.event, metaId: event.metaId, videos: event.videos.length, matched }, 'watched status synced');
+    return;
+  }
+
+  const kind: Kind = event.scope === 'movie' ? 'movie' : 'series';
+  const itemIds = await videoItemIds(kind, event.metaId, event, libraryIds);
+  if (!itemIds.length) {
+    log.debug({ event: event.event, videoId: event.videoId }, 'no Jellyfin item for watch state event');
+    return;
+  }
+
+  if (event.event === 'stop') {
+    const share = event.durationMs ? event.positionMs / event.durationMs : undefined;
+    const played = event.played ?? (share !== undefined && share >= PLAYED_SHARE);
+    if (!played && (share === undefined || share < MIN_RESUME)) return;
+    for (const itemId of itemIds) {
+      if (played) await setPlayed(itemId, userId, true, at);
+      else await setResumePosition(itemId, userId, event.positionMs, at);
+    }
+    log.info({ videoId: event.videoId, played, items: itemIds.length }, played ? 'marked watched' : 'resume point saved');
+    return;
+  }
+
+  for (const itemId of itemIds) await setPlayed(itemId, userId, event.event === 'played', at);
+  log.info({ event: event.event, videoId: event.videoId, items: itemIds.length }, 'watched status synced');
+}
+
+// ---------------------------------------------------------------------------
 // The addon
 // ---------------------------------------------------------------------------
+
+const ID_PREFIXES = ['tt', 'tmdb:', 'tvdb:', ...ANIME_SOURCES.map((source) => `${source}:`)];
 
 const addon = defineAddon({
   manifest: (config) => {
     const chosen = config ? libraries.filter((library) => chosenIds(config).has(library.Id)) : libraries;
     const showCatalogs = config?.catalogs ?? true;
+    const syncWatched = !!config && watchUserId(config) !== undefined;
     return {
       id: 'local.jellyfin.aiostreams',
       version: '0.1.0',
@@ -456,8 +576,15 @@ const addon = defineAddon({
       description:
         'Plays files from your chosen Jellyfin libraries: as versions of the titles you open, and optionally as catalogs.',
       types: ['movie', 'series'],
-      idPrefixes: ['tt', 'tmdb:', 'tvdb:', ...ANIME_SOURCES.map((source) => `${source}:`)],
-      resources: showCatalogs ? ['catalog', 'stream'] : ['stream'],
+      idPrefixes: ID_PREFIXES,
+      resources: [
+        ...(showCatalogs ? ['catalog' as const] : []),
+        'stream',
+        ...(syncWatched ? [{ name: 'watch_state' as const, types: ['movie', 'series'], idPrefixes: ID_PREFIXES }] : []),
+      ],
+      watchState: syncWatched
+        ? { version: 2, push: { events: ['stop', 'played', 'unplayed'], bulk: true } }
+        : undefined,
       catalogs: showCatalogs
         ? chosen.flatMap((library) =>
             kindsOf(library).map((type) => ({
@@ -511,6 +638,10 @@ const addon = defineAddon({
     log.debug({ matches: targets.length, streams: streams.length }, 'streams found');
     // Short cache: stream links carry the session token.
     return { streams, cacheMaxAge: 300 };
+  },
+
+  watchState: {
+    push: ({ event, config, log }) => pushWatchState(event, config, log),
   },
 });
 

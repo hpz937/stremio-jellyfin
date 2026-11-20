@@ -29,6 +29,13 @@ export const env = defineEnv({
    */
   ACCESS_KEY: z.string().min(12, 'use at least 12 characters'),
 
+  /**
+   * An admin API key (Dashboard → API Keys), only needed to sync watched status to a
+   * Jellyfin user other than JELLYFIN_USERNAME. It stays on this server: it is never
+   * put in stream links.
+   */
+  JELLYFIN_API_KEY: z.string().optional(),
+
   /** How often the library index is rebuilt. */
   REFRESH_MINUTES: z.coerce.number().min(1).default(15),
 

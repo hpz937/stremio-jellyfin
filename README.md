@@ -5,6 +5,7 @@ An AIOStreams/Stremio addon that offers files from **chosen Jellyfin libraries**
 - **Streams:** when you open a title (IMDb `tt…`, `tmdb:…`, `tvdb:…`, or for anime `anilist:…`, `kitsu:…`, `mal:…` id), every matching file in your chosen libraries is listed as a version, e.g. `Jellyfin 2160p`.
 - **Browser versions (optional, on by default):** a file a web browser can't play (MKV, HEVC, 10-bit…) also gets a `Jellyfin 1080p Browser` link. Jellyfin transcodes it to H.264 + AAC over HLS, and only repackages it when the video already fits. The addon's Jellyfin user needs *Allow video playback that requires transcoding*.
 - **Catalogs (optional):** each chosen library becomes a catalog, which is a library in the AIOStreams app.
+- **Watched status (optional):** what you finish, stop or mark watched in AIOStreams is marked in Jellyfin for a user you pick. See [Watched status](#watched-status).
 
 Jellyfin does the matching (its provider ids) and serves the video. This addon only looks things up and returns links to Jellyfin: direct play, plus Jellyfin-transcoded browser versions when those are on.
 
@@ -29,6 +30,20 @@ Anyone who can open `/configure` still sees your library names. Keep the addon o
 The library choices are read when the addon starts, so restart it after adding or renaming a Jellyfin library. Install links name libraries, and the addon remembers every name a library has had, so links made before a rename keep working. Titles inside libraries are re-indexed every `REFRESH_MINUTES` (default 15).
 
 Titles Jellyfin couldn't match to an IMDb, TMDB, TVDB or AniList id are skipped; run with `LOG_LEVEL=debug` to list them. You can fix a match in Jellyfin with *Identify*.
+
+### Watched status
+
+Pick a Jellyfin user under *Sync watched status to* on the configure page, and reinstall the link in AIOStreams. AIOStreams then tells the addon (through its *Watch State* resource) whenever a movie or episode is:
+
+- finished (past AIOStreams' played threshold, 90% by default): it's marked watched in Jellyfin;
+- stopped part way (past 5%): Jellyfin gets its resume point;
+- marked watched or unwatched by hand, including a whole season or show at once.
+
+This works whichever addon's stream you watched, as long as the title is in one of the link's libraries. Every version of it there is marked. Episodes are found the same way as their streams, so anime ids work too.
+
+Out of the box only the addon's own Jellyfin user can be picked. To sync to your own account, create an API key in Jellyfin (Dashboard → API Keys) and set `JELLYFIN_API_KEY`; every Jellyfin user can then be picked. The key can change any user's data, but it stays on this server and never goes into a link. With it set, the configure page lists Jellyfin user names, like it lists library names. The user list is read when the addon starts, so restart it after adding a user.
+
+Each install link syncs to one Jellyfin user, so give each person their own link. To turn syncing off, pick *off*, or untick *Watch State* in the addon's Resources in AIOStreams.
 
 ### Anime ids
 

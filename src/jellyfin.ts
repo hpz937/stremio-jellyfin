@@ -138,34 +138,99 @@ export async function getSession(): Promise<Session> {
   return session;
 }
 
-/** GET a Jellyfin API path as the addon's user, signing in again once if the token was revoked. */
-export async function api<T>(
+type Params = Record<string, string | number | boolean | undefined>;
+
+async function request(
+  method: string,
   path: string,
-  params: Record<string, string | number | boolean | undefined> = {},
-  retried = false
-): Promise<T> {
-  const { token, userId } = await getSession();
+  token: string,
+  params: Params,
+  body?: unknown
+): Promise<Response> {
   const url = new URL(`${env.JELLYFIN_URL}${path}`);
-  url.searchParams.set('userId', userId);
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined) url.searchParams.set(key, String(value));
   }
-  let res: Response;
   try {
-    res = await fetch(url, {
-      headers: { authorization: `MediaBrowser ${CLIENT}, Token="${token}"` },
+    return await fetch(url, {
+      method,
+      headers: {
+        authorization: `MediaBrowser ${CLIENT}, Token="${token}"`,
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(15_000),
     });
   } catch (err) {
     log.error({ err, path }, 'Jellyfin unreachable');
     throw new AddonError(502, 'Jellyfin is unreachable');
   }
+}
+
+/** GET a Jellyfin API path as the addon's user, signing in again once if the token was revoked. */
+export async function api<T>(path: string, params: Params = {}, retried = false): Promise<T> {
+  const { token, userId } = await getSession();
+  const res = await request('GET', path, token, { userId, ...params });
   if (res.status === 401 && !retried) {
     session = undefined;
     return api<T>(path, params, true);
   }
   if (!res.ok) throw new Error(`Jellyfin answered ${res.status} to ${path}`);
   return (await res.json()) as T;
+}
+
+// ---------------------------------------------------------------------------
+// Watched status. The addon's own user can only change its own; another user's
+// needs JELLYFIN_API_KEY (an admin key), which never leaves this server.
+// ---------------------------------------------------------------------------
+
+export interface User {
+  Id: string;
+  Name: string;
+}
+
+/** Every Jellyfin user, when JELLYFIN_API_KEY is set; otherwise only the addon's. */
+export async function users(): Promise<User[]> {
+  const own = { Id: (await getSession()).userId, Name: env.JELLYFIN_USERNAME };
+  if (!env.JELLYFIN_API_KEY) return [own];
+  const res = await request('GET', '/Users', env.JELLYFIN_API_KEY, { isDisabled: false });
+  if (!res.ok) throw new Error(`Jellyfin answered ${res.status} to /Users; is JELLYFIN_API_KEY right?`);
+  return (await res.json()) as User[];
+}
+
+/** A write to a user's data, as the admin key when there is one, else as the addon's user. */
+async function writeUserData(method: string, path: string, userId: string, params: Params = {}, body?: unknown) {
+  let res: Response;
+  if (env.JELLYFIN_API_KEY) {
+    res = await request(method, path, env.JELLYFIN_API_KEY, { userId, ...params }, body);
+  } else {
+    res = await request(method, path, (await getSession()).token, { userId, ...params }, body);
+    if (res.status === 401) {
+      session = undefined;
+      res = await request(method, path, (await getSession()).token, { userId, ...params }, body);
+    }
+  }
+  if (res.status === 401 || res.status === 403) {
+    throw new AddonError(403, `Jellyfin refused to change user data (${res.status}); check JELLYFIN_API_KEY`);
+  }
+  // A 5xx is passed on as one, so AIOStreams retries the event later.
+  if (res.status >= 500) throw new AddonError(502, `Jellyfin answered ${res.status}`);
+  if (!res.ok) log.warn({ status: res.status, path }, 'Jellyfin did not change user data');
+}
+
+/** Marks an item (movie or episode) watched or unwatched for a user. */
+export async function setPlayed(itemId: string, userId: string, played: boolean, at?: Date): Promise<void> {
+  await writeUserData(played ? 'POST' : 'DELETE', `/UserPlayedItems/${itemId}`, userId, {
+    datePlayed: played && at ? at.toISOString() : undefined,
+  });
+}
+
+/** Sets where a user's playback of an item resumes. */
+export async function setResumePosition(itemId: string, userId: string, positionMs: number, at?: Date) {
+  await writeUserData('POST', `/UserItems/${itemId}/UserData`, userId, {}, {
+    PlaybackPositionTicks: Math.round(positionMs * 10_000),
+    LastPlayedDate: at?.toISOString(),
+  });
 }
 
 /** The libraries the addon's user can see. */
